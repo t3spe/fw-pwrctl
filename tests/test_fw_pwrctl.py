@@ -7,20 +7,26 @@ Run without root:  python3 tests/test_fw_pwrctl.py
 All tests use temp directories — no system files touched.
 """
 
+import glob
 import io
 import json
 import os
+import re
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import time
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import fw_pwrctl
 from fw_pwrctl import (
-    SensorLogger, PIPL1Controller, Hardware,
+    SensorLogger, PIPL1Controller, Hardware, PrometheusTextfileWriter,
     validate_config, run, preflight_checks,
     CRITICAL_TEMP, SENSOR_RESCAN_AFTER, ECTOOL, EC_THERMAL_OVERRIDES,
-    EC_OVERRIDE_RECHECK,
+    EC_OVERRIDE_RECHECK, __version__,
 )
 
 LIVE = "--live" in sys.argv
@@ -1043,6 +1049,50 @@ bad_config("idleCeilingW below pl1MinW",
 bad_config("idleCeilingW above pl1MaxW",
            {"setpoint": 75, "Kp": 1, "Ki": 0.1,
             "pl1MaxW": 28, "idleCeilingW": 30}, "idleCeilingW")
+bad_config("metrics not an object",
+           {"setpoint": 75, "Kp": 1, "Ki": 0.1,
+            "metrics": "yes"}, "metrics must be an object")
+bad_config("metrics.enabled not a boolean",
+           {"setpoint": 75, "Kp": 1, "Ki": 0.1,
+            "metrics": {"enabled": "true"}}, "metrics.enabled")
+bad_config("metrics.path not a string",
+           {"setpoint": 75, "Kp": 1, "Ki": 0.1,
+            "metrics": {"path": 42}}, "metrics.path")
+bad_config("metrics.path wrong suffix",
+           {"setpoint": 75, "Kp": 1, "Ki": 0.1,
+            "metrics": {"path": "/var/log/fw-pwrctl/textfile/m.txt"}}, ".prom")
+bad_config("metrics.path relative",
+           {"setpoint": 75, "Kp": 1, "Ki": 0.1,
+            "metrics": {"path": "textfile/fw_pwrctl.prom"}}, "absolute")
+
+for _desc, _met in [
+    ("absent", None),
+    ("empty object", {}),
+    ("enabled, default path", {"enabled": True}),
+    ("enabled with explicit path",
+     {"enabled": True, "path": "/var/log/fw-pwrctl/textfile/x.prom"}),
+    ("disabled with a path", {"enabled": False, "path": "/tmp/x.prom"}),
+]:
+    _cfg = {"setpoint": 75, "Kp": 0.25, "Ki": 0.021}
+    if _met is not None:
+        _cfg["metrics"] = _met
+    try:
+        validate_config(_cfg)
+        check(f"valid metrics: {_desc}", True)
+    except ValueError as e:
+        check(f"valid metrics: {_desc}", False, str(e))
+
+# metrics must be a known key — an unknown key warns on stderr, which would
+# fire on every start for a correctly configured install.
+_warn_err = io.StringIO()
+_old_err, sys.stderr = sys.stderr, _warn_err
+try:
+    validate_config({"setpoint": 75, "Kp": 0.25, "Ki": 0.021,
+                     "metrics": {"enabled": True}})
+finally:
+    sys.stderr = _old_err
+check("metrics is a known config key",
+      "unknown config key" not in _warn_err.getvalue(), _warn_err.getvalue())
 
 
 ###########################################################################
@@ -2535,6 +2585,709 @@ if recovery_writes:
           f"first recovery write: {recovery_writes[0] / 1e6:.1f}W (expected <= 8W)")
 else:
     check("recovery writes after min", False, "no recovery writes found")
+
+
+###########################################################################
+#                  PROMETHEUS TEXTFILE EXPORT                              #
+###########################################################################
+
+# node_exporter drops the whole file on a syntax error, so the format is
+# checked by a strict parser here rather than assumed. prometheus_client and
+# promtool are used as extra oracles when present, but are NOT required —
+# CI runs this suite with no third-party packages installed.
+
+_PROM_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_PROM_SAMPLE = re.compile(
+    r'^(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)(?:\{(?P<labels>.*)\})? (?P<value>\S+)$')
+_PROM_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+_PROM_TYPES = ("gauge", "counter", "histogram", "summary", "untyped")
+
+
+def parse_prom(text):
+    """Parse the text exposition format strictly.
+
+    Returns {family: {"type", "help", "samples": [(labels, value_str)]}}.
+    Raises ValueError on anything node_exporter would reject, plus the
+    stricter invariants this writer promises (every family declared, samples
+    contiguous, no per-sample timestamps).
+    """
+    if not text.endswith("\n"):
+        raise ValueError("no trailing newline")
+    if "\r" in text:
+        raise ValueError("CR present — LF line endings required")
+    families = {}
+    blocks = []  # family name per contiguous run of sample lines
+    for lineno, line in enumerate(text.split("\n")[:-1], 1):
+        if not line:
+            raise ValueError(f"line {lineno}: blank line")
+        if line.startswith("# HELP ") or line.startswith("# TYPE "):
+            kind = line[2:6]
+            parts = line[7:].split(" ", 1)
+            name = parts[0]
+            if not _PROM_NAME.match(name):
+                raise ValueError(f"line {lineno}: bad metric name {name!r}")
+            fam = families.setdefault(
+                name, {"type": None, "help": None, "samples": []})
+            if kind == "HELP":
+                if fam["help"] is not None:
+                    raise ValueError(f"line {lineno}: duplicate HELP for {name}")
+                fam["help"] = parts[1] if len(parts) > 1 else ""
+            else:
+                if fam["type"] is not None:
+                    raise ValueError(f"line {lineno}: duplicate TYPE for {name}")
+                if len(parts) != 2 or parts[1] not in _PROM_TYPES:
+                    raise ValueError(f"line {lineno}: bad TYPE line {line!r}")
+                fam["type"] = parts[1]
+            continue
+        if line.startswith("#"):
+            continue
+        m = _PROM_SAMPLE.match(line)
+        if not m:
+            # Also what a trailing "name value timestamp" would fail on.
+            raise ValueError(f"line {lineno}: malformed sample {line!r}")
+        name, raw_labels, value = m.group("name", "labels", "value")
+        labels = {}
+        if raw_labels is not None:
+            pairs = _PROM_LABEL.findall(raw_labels)
+            if ",".join(f'{k}="{v}"' for k, v in pairs) != raw_labels:
+                raise ValueError(f"line {lineno}: malformed labels {raw_labels!r}")
+            for k, v in pairs:
+                if k in labels:
+                    raise ValueError(f"line {lineno}: duplicate label {k!r}")
+                labels[k] = v
+        if value not in ("NaN", "+Inf", "-Inf"):
+            try:
+                float(value)
+            except ValueError:
+                raise ValueError(f"line {lineno}: bad value {value!r}")
+            # Python prints these lowercase; Prometheus rejects them.
+            if value.lower().lstrip("+-") in ("nan", "inf", "infinity"):
+                raise ValueError(f"line {lineno}: {value!r} must be NaN/+Inf/-Inf")
+        if name not in families:
+            raise ValueError(f"line {lineno}: sample {name} has no HELP/TYPE")
+        families[name]["samples"].append((labels, value))
+        if not blocks or blocks[-1] != name:
+            blocks.append(name)
+    if len(blocks) != len(set(blocks)):
+        raise ValueError("family samples are not contiguous")
+    for name, fam in families.items():
+        if fam["type"] is None:
+            raise ValueError(f"{name}: missing TYPE")
+        if fam["help"] is None:
+            raise ValueError(f"{name}: missing HELP")
+        if not fam["samples"]:
+            raise ValueError(f"{name}: declared but has no samples")
+    return families
+
+
+FIXED_ENTRY = {
+    "timestamp": "2026-07-18T14:00:00+02:00",
+    "rapl_pl1_w": 15.0,
+    "throttle": {"package_throttle_count": 1791820,
+                 "core_throttle_count": 247222},
+    "board_temps": {"sen2_c": 53.9, "sen3_c": 56.9,
+                    "sen4_c": 37.9, "sen5_c": 58.9},
+    "cpu": {"user": 3.2, "load_1m": 0.5},       # must NOT be exported
+    "memory": {"total_mb": 32000},              # must NOT be exported
+    "controller": {
+        "pl1_w": 15.0, "raw_temp_c": 64.0, "median_c": 62.0, "error": -13.0,
+        "integral": 76.9, "setpoint_c": 75, "pl1_min_w": 5, "pl1_max_w": 28,
+        "idle_active": True, "idle_ceiling_w": 15, "guard_active": False,
+        "epp_active": True, "sen5_c": 58.9,
+    },
+}
+
+
+def prom_writer(td, name="fw_pwrctl.prom"):
+    """Writer targeting a textfile/ subdirectory that does not exist yet."""
+    return PrometheusTextfileWriter(os.path.join(td, "textfile", name))
+
+
+# ── 0. The validator itself ───────────────────────────────────────────
+
+# A parser that accepts everything would make section 1 meaningless, so
+# check it rejects each way the format can go wrong.
+
+print("\n── Prometheus textfile: format validator ──")
+
+try:
+    parse_prom('# HELP a_m help.\n# TYPE a_m gauge\na_m{k="v"} 1.5\n')
+    check("validator accepts valid input", True)
+except ValueError as e:
+    check("validator accepts valid input", False, str(e))
+
+for _desc, _bad in [
+    ("duplicate HELP", '# HELP m h\n# TYPE m gauge\nm 1\n# HELP m h2\nm 2\n'),
+    ("duplicate TYPE", '# HELP m h\n# TYPE m gauge\n# TYPE m counter\nm 1\n'),
+    ("per-sample timestamp", '# HELP m h\n# TYPE m gauge\nm 1 1752875800000\n'),
+    ("no trailing newline", '# HELP m h\n# TYPE m gauge\nm 1'),
+    ("CRLF line endings", '# HELP m h\r\n# TYPE m gauge\r\nm 1\r\n'),
+    ("lowercase nan", '# HELP m h\n# TYPE m gauge\nm nan\n'),
+    ("lowercase inf", '# HELP m h\n# TYPE m gauge\nm inf\n'),
+    ("bad metric name", '# HELP 9m h\n# TYPE 9m gauge\n9m 1\n'),
+    ("sample without HELP/TYPE", '# HELP m h\n# TYPE m gauge\nm 1\nother 2\n'),
+    ("missing TYPE", '# HELP m h\nm 1\n'),
+    ("missing HELP", '# TYPE m gauge\nm 1\n'),
+    ("non-contiguous family",
+     '# HELP a h\n# TYPE a gauge\n# HELP b h\n# TYPE b gauge\na 1\nb 2\na 3\n'),
+    ("non-numeric value", '# HELP m h\n# TYPE m gauge\nm abc\n'),
+    ("unquoted label value", '# HELP m h\n# TYPE m gauge\nm{k=v} 1\n'),
+    ("duplicate label", '# HELP m h\n# TYPE m gauge\nm{k="1",k="2"} 1\n'),
+    ("misspelled type", '# HELP m h\n# TYPE m guage\nm 1\n'),
+    ("blank line", '# HELP m h\n# TYPE m gauge\n\nm 1\n'),
+    ("family with no samples", '# HELP m h\n# TYPE m gauge\n'),
+]:
+    try:
+        parse_prom(_bad)
+        check(f"validator rejects: {_desc}", False, "accepted bad input")
+    except ValueError:
+        check(f"validator rejects: {_desc}", True)
+
+
+# ── 1. Format validity ────────────────────────────────────────────────
+
+print("\n── Prometheus textfile: format validity ──")
+
+_td = tempfile.mkdtemp()
+writer = prom_writer(_td)
+TEXT = writer.render(FIXED_ENTRY, now=1752875800.0)
+
+FAMS = None
+try:
+    FAMS = parse_prom(TEXT)
+    check("output parses as exposition format", True)
+except ValueError as e:
+    check("output parses as exposition format", False, str(e))
+
+check("trailing newline", TEXT.endswith("\n"))
+check("LF line endings only", "\r" not in TEXT)
+check("encodes as UTF-8", TEXT.encode("utf-8").decode("utf-8") == TEXT)
+check("no per-sample timestamps",
+      all(len(ln.split(" ")) == 2 for ln in TEXT.splitlines()
+          if not ln.startswith("#")))
+check("all names snake_case with fw_pwrctl_ prefix",
+      all(n.startswith("fw_pwrctl_") and _PROM_NAME.match(n) and n.islower()
+          for n in (FAMS or {})))
+check("one HELP/TYPE per family",
+      all(TEXT.count(f"# TYPE {n} ") == 1 and TEXT.count(f"# HELP {n} ") == 1
+          for n in (FAMS or {})))
+
+# node_exporter already exports these from the same chips — no duplicates.
+check("cpu/memory not exported",
+      "load_1m" not in TEXT and "total_mb" not in TEXT and "_bytes" not in TEXT)
+
+if FAMS:
+    required = {
+        "fw_pwrctl_build_info", "fw_pwrctl_up",
+        "fw_pwrctl_last_write_timestamp_seconds",
+        "fw_pwrctl_rapl_pl1_watts", "fw_pwrctl_controller_pl1_target_watts",
+        "fw_pwrctl_pl1_min_watts", "fw_pwrctl_pl1_max_watts",
+        "fw_pwrctl_controller_setpoint_celsius",
+        "fw_pwrctl_controller_temp_celsius",
+        "fw_pwrctl_controller_error_celsius",
+        "fw_pwrctl_controller_integral_watts", "fw_pwrctl_idle_ceiling_watts",
+        "fw_pwrctl_idle_active", "fw_pwrctl_guard_active",
+        "fw_pwrctl_epp_active", "fw_pwrctl_cpu_throttle_total",
+        "fw_pwrctl_board_temp_celsius",
+    }
+    check("all required families present", required <= set(FAMS),
+          f"missing: {sorted(required - set(FAMS))}")
+    check("controller temp is one family, two series",
+          [l["kind"] for l, _ in
+           FAMS["fw_pwrctl_controller_temp_celsius"]["samples"]]
+          == ["raw", "median"])
+    check("board temps are one family, four series",
+          [l["sensor"] for l, _ in
+           FAMS["fw_pwrctl_board_temp_celsius"]["samples"]]
+          == ["sen2", "sen3", "sen4", "sen5"])
+    check("throttle is one family, two series",
+          [l["scope"] for l, _ in
+           FAMS["fw_pwrctl_cpu_throttle_total"]["samples"]]
+          == ["package", "core"])
+
+# Optional oracles — skipped silently when unavailable.
+try:
+    from prometheus_client.parser import text_string_to_metric_families
+except ImportError:
+    text_string_to_metric_families = None
+if text_string_to_metric_families is not None:
+    try:
+        fams = list(text_string_to_metric_families(TEXT))
+        check("prometheus_client parses output", len(fams) == len(FAMS or {}),
+              f"{len(fams)} families")
+    except Exception as e:
+        check("prometheus_client parses output", False, repr(e))
+else:
+    print("  SKIP  prometheus_client parser (not installed)")
+
+if shutil.which("promtool"):
+    r = subprocess.run(["promtool", "check", "metrics"], input=TEXT,
+                       capture_output=True, text=True, timeout=30)
+    check("promtool check metrics", r.returncode == 0,
+          (r.stdout + r.stderr).strip()[:300])
+else:
+    print("  SKIP  promtool check metrics (not on PATH)")
+
+
+# ── 2. Value correctness ──────────────────────────────────────────────
+
+print("\n── Prometheus textfile: values ──")
+
+_lines = set(TEXT.splitlines())
+for expected in [
+    f'fw_pwrctl_build_info{{version="{__version__}"}} 1',
+    "fw_pwrctl_up 1",
+    "fw_pwrctl_last_write_timestamp_seconds 1752875800.0",
+    "fw_pwrctl_rapl_pl1_watts 15.0",
+    "fw_pwrctl_controller_pl1_target_watts 15.0",
+    "fw_pwrctl_pl1_min_watts 5",
+    "fw_pwrctl_pl1_max_watts 28",
+    "fw_pwrctl_controller_setpoint_celsius 75",
+    'fw_pwrctl_controller_temp_celsius{kind="raw"} 64.0',
+    'fw_pwrctl_controller_temp_celsius{kind="median"} 62.0',
+    "fw_pwrctl_controller_error_celsius -13.0",
+    "fw_pwrctl_controller_integral_watts 76.9",
+    "fw_pwrctl_idle_ceiling_watts 15",
+    "fw_pwrctl_idle_active 1",       # bool True  -> 1
+    "fw_pwrctl_guard_active 0",      # bool False -> 0
+    "fw_pwrctl_epp_active 1",
+    'fw_pwrctl_cpu_throttle_total{scope="package"} 1791820',
+    'fw_pwrctl_cpu_throttle_total{scope="core"} 247222',
+    'fw_pwrctl_board_temp_celsius{sensor="sen2"} 53.9',
+    'fw_pwrctl_board_temp_celsius{sensor="sen5"} 58.9',
+]:
+    check(f"sample: {expected}", expected in _lines)
+
+check("timestamp defaults to now()",
+      abs(float(re.search(r"^fw_pwrctl_last_write_timestamp_seconds (\S+)$",
+                          writer.render(FIXED_ENTRY), re.M).group(1))
+          - time.time()) < 5)
+
+# Label/HELP escaping — values here are all writer-controlled, but the
+# escaping must still be correct if a version string ever contains one.
+check("label escaping", fw_pwrctl._prom_escape_label('a\\b"c\nd')
+      == 'a\\\\b\\"c\\nd')
+check("help escaping", fw_pwrctl._prom_escape_help("back\\slash\nnl")
+      == "back\\\\slash\\nnl")
+check("empty label set renders bare", fw_pwrctl._prom_labels({}) == "")
+
+
+# ── 3. Counter vs gauge ───────────────────────────────────────────────
+
+print("\n── Prometheus textfile: metric types ──")
+
+if FAMS:
+    counters = {n for n, f in FAMS.items() if f["type"] == "counter"}
+    check("throttle family is a counter",
+          counters == {"fw_pwrctl_cpu_throttle_total"}, f"counters: {counters}")
+    check("every counter name ends in _total",
+          all(n.endswith("_total") for n in counters))
+    check("no gauge name ends in _total",
+          not any(n.endswith("_total") for n, f in FAMS.items()
+                  if f["type"] == "gauge"))
+    check("everything else is a gauge",
+          all(f["type"] in ("gauge", "counter") for f in FAMS.values()))
+    check("units are base SI suffixes",
+          all(n.endswith(("_watts", "_celsius", "_seconds", "_total",
+                          "_info", "_active", "fw_pwrctl_up"))
+              for n in FAMS), sorted(FAMS))
+
+
+# ── 4. Atomic write ───────────────────────────────────────────────────
+
+print("\n── Prometheus textfile: atomic write ──")
+
+_td2 = tempfile.mkdtemp()
+w2 = prom_writer(_td2)
+check("temp is not a .prom file", not w2._tmp_path.endswith(".prom"),
+      w2._tmp_path)
+check("temp sits beside the destination (same filesystem)",
+      os.path.dirname(w2._tmp_path) == os.path.dirname(w2.path))
+check("temp name is pid-scoped", str(os.getpid()) in w2._tmp_path)
+
+_real_replace = os.replace
+_replace_calls = []
+
+
+def _spy_replace(src, dst):
+    _replace_calls.append((src, dst))
+    return _real_replace(src, dst)
+
+
+os.replace = _spy_replace
+try:
+    w2.write(FIXED_ENTRY)
+finally:
+    os.replace = _real_replace
+
+check("writes via os.replace(tmp, path)",
+      _replace_calls == [(w2._tmp_path, w2.path)], str(_replace_calls))
+check("destination created", os.path.exists(w2.path))
+check("destination mode is 0644",
+      stat.S_IMODE(os.stat(w2.path).st_mode) == 0o644,
+      oct(stat.S_IMODE(os.stat(w2.path).st_mode)))
+check("creates the directory on demand", os.path.isdir(os.path.dirname(w2.path)))
+
+# A 0644 file inside a 0700 directory is unreadable to node_exporter, so the
+# directory mode matters as much as the file mode. Verified under a hostile
+# umask, since makedirs() masks its mode argument.
+_umask_td = tempfile.mkdtemp()
+_old_umask = os.umask(0o077)
+try:
+    _uw = prom_writer(_umask_td)
+    _uw.write(FIXED_ENTRY)
+finally:
+    os.umask(_old_umask)
+check("created directory is traversable (0755) despite a strict umask",
+      stat.S_IMODE(os.stat(os.path.dirname(_uw.path)).st_mode) == 0o755,
+      oct(stat.S_IMODE(os.stat(os.path.dirname(_uw.path)).st_mode)))
+check("file is 0644 despite a strict umask",
+      stat.S_IMODE(os.stat(_uw.path).st_mode) == 0o644,
+      oct(stat.S_IMODE(os.stat(_uw.path).st_mode)))
+
+# An existing directory keeps whatever mode the operator gave it.
+_pre_td = tempfile.mkdtemp()
+os.mkdir(os.path.join(_pre_td, "textfile"), 0o700)
+os.chmod(os.path.join(_pre_td, "textfile"), 0o700)
+prom_writer(_pre_td).write(FIXED_ENTRY)
+check("pre-existing directory is not re-permissioned",
+      stat.S_IMODE(os.stat(os.path.join(_pre_td, "textfile")).st_mode) == 0o700)
+_leftovers = [os.path.basename(p)
+              for p in glob.glob(os.path.join(os.path.dirname(w2.path), "*"))
+              if p != w2.path]
+check("no leftover temp after a successful write", _leftovers == [], str(_leftovers))
+
+# A failing replace must leave the previous file intact and drop the temp —
+# node_exporter never sees a partial file.
+_first = open(w2.path).read()
+w2.write({"rapl_pl1_w": 99.0})
+check("overwrites in place with fresh values",
+      "fw_pwrctl_rapl_pl1_watts 99.0" in open(w2.path).read())
+
+
+def _boom_replace(src, dst):
+    raise OSError("replace failed")
+
+
+_err = io.StringIO()
+_old_err, sys.stderr = sys.stderr, _err
+os.replace = _boom_replace
+try:
+    w2.write(FIXED_ENTRY)   # must not raise
+    check("write() survives a failing os.replace", True)
+except Exception as e:
+    check("write() survives a failing os.replace", False, repr(e))
+finally:
+    os.replace = _real_replace
+    sys.stderr = _old_err
+
+check("failed replace leaves the old file readable",
+      "fw_pwrctl_rapl_pl1_watts 99.0" in open(w2.path).read())
+check("failed replace removes the temp", not os.path.exists(w2._tmp_path))
+check("failed replace reports to stderr",
+      "Prometheus textfile write failed" in _err.getvalue(), _err.getvalue())
+
+
+# ── 5. Disabled unless configured ─────────────────────────────────────
+
+print("\n── Prometheus textfile: opt-in ──")
+
+check("SensorLogger has no writer by default", SensorLogger({})._metrics is None)
+check("metrics disabled by default", SensorLogger({}).metrics_enabled is False)
+check("a path alone does not enable metrics",
+      SensorLogger({}, metrics_config={"path": "/tmp/x.prom"})._metrics is None)
+check("enabled with no path uses the default under /var/log/fw-pwrctl",
+      SensorLogger({}, metrics_config={"enabled": False}).metrics_path
+      == "/var/log/fw-pwrctl/textfile/fw_pwrctl.prom")
+check("SensorLogger signature is backward compatible",
+      SensorLogger({"enabled": False}, None)._metrics is None)
+
+
+# ── 5b. The two sinks are independently switchable ────────────────────
+
+print("\n── Sinks: logging × metrics matrix ──")
+
+# The point of separate `enabled` flags: either, both, or neither.
+for _jsonl, _prom_on in [(False, False), (True, False), (False, True), (True, True)]:
+    _mtd = tempfile.mkdtemp()
+    _jpath = os.path.join(_mtd, "sensor-log.json")
+    _ppath = os.path.join(_mtd, "textfile", "fw_pwrctl.prom")
+    _mcfg = {
+        "setpoint": 75, "Kp": 0.25, "Ki": 0.021, "updateInterval": 1,
+        "logging": {"enabled": _jsonl, "path": _jpath},
+        "metrics": {"enabled": _prom_on, "path": _ppath},
+    }
+    hw = MockHardware()
+    hw.temps = deque([70.0] * 20)
+    hw.sen5_sensor_path = None
+    hw.system_snapshot = {"rapl_pl1_w": 15.0}
+    run_quiet(_mcfg, hw, max_ticks=4)
+    _label = f"logging={_jsonl}, metrics={_prom_on}"
+    check(f"{_label} -> JSONL {'written' if _jsonl else 'absent'}",
+          os.path.exists(_jpath) is _jsonl)
+    check(f"{_label} -> .prom {'written' if _prom_on else 'absent'}",
+          os.path.exists(_ppath) is _prom_on)
+    # PL1 control runs regardless of which sinks are on.
+    check(f"{_label} -> PL1 control unaffected", len(hw.rapl_writes) >= 2)
+
+# Omitting the metrics section entirely behaves as disabled.
+_td3 = tempfile.mkdtemp()
+_cfg_off = {"setpoint": 75, "Kp": 0.25, "Ki": 0.021, "updateInterval": 1,
+            "logging": {"enabled": True,
+                        "path": os.path.join(_td3, "sensor-log.json")}}
+hw = MockHardware()
+hw.temps = deque([70.0] * 20)
+hw.sen5_sensor_path = None
+run_quiet(_cfg_off, hw, max_ticks=4)
+check("no .prom written when the metrics section is absent",
+      glob.glob(os.path.join(_td3, "**", "*.prom"), recursive=True) == [])
+check("JSONL logging unaffected when metrics are off",
+      os.path.exists(os.path.join(_td3, "sensor-log.json")))
+
+
+# ── 6. Fail-safe: never disturbs the control loop ─────────────────────
+
+print("\n── Prometheus textfile: fail-safe ──")
+
+_td4 = tempfile.mkdtemp()
+w4 = prom_writer(_td4)
+
+
+def _boom_open(*a, **k):
+    raise OSError("disk on fire")
+
+
+_err = io.StringIO()
+_old_err, sys.stderr = sys.stderr, _err
+fw_pwrctl.open = _boom_open       # shadows builtins for the daemon module
+try:
+    w4.write(FIXED_ENTRY)
+    check("write() swallows an open() failure", True)
+except Exception as e:
+    check("write() swallows an open() failure", False, repr(e))
+finally:
+    del fw_pwrctl.open
+    sys.stderr = _old_err
+
+check("open() failure reported once to stderr",
+      _err.getvalue().count("Prometheus textfile write failed") == 1,
+      _err.getvalue())
+check("no file produced by a failed write", not os.path.exists(w4.path))
+
+# Repeated failures must not flood the journal — one write every ~2s would
+# otherwise emit tens of thousands of identical lines a day.
+_err = io.StringIO()
+_old_err, sys.stderr = sys.stderr, _err
+fw_pwrctl.open = _boom_open
+try:
+    for _ in range(50):
+        w4.write(FIXED_ENTRY)
+finally:
+    del fw_pwrctl.open
+    sys.stderr = _old_err
+check("repeat failures are rate-limited",
+      _err.getvalue().count("Prometheus textfile write failed") == 0,
+      f"{_err.getvalue().count('failed')} lines for 50 failures")
+check("failures are counted", w4._failures == 51, str(w4._failures))
+
+# Recovery: once the fault clears, the next write succeeds.
+w4.write(FIXED_ENTRY)
+check("recovers after the fault clears", os.path.exists(w4.path))
+check("failure counter resets on success", w4._failures == 0)
+
+# The JSONL sink switches itself off after 3 failed flushes. Metrics are an
+# independent sink and must survive that.
+_td4b = tempfile.mkdtemp()
+_blocked = os.path.join(_td4b, "blocked")
+open(_blocked, "w").close()      # a file where the log directory must be
+_prom4b = os.path.join(_td4b, "textfile", "fw_pwrctl.prom")
+_sl = SensorLogger({"enabled": True,
+                    "path": os.path.join(_blocked, "sensor-log.json"),
+                    "flushIntervalSeconds": 0},   # flush on every log()
+                   hw=None,
+                   metrics_config={"enabled": True, "path": _prom4b})
+_err = io.StringIO()
+_old_err, sys.stderr = sys.stderr, _err
+try:
+    for _ in range(5):
+        _sl.log(controller_state={"pl1_w": 12.0})
+finally:
+    sys.stderr = _old_err
+check("JSONL sink gives up after repeated flush failures", _sl.enabled is False)
+check("metrics keep being written after JSONL gives up",
+      os.path.exists(_prom4b)
+      and "fw_pwrctl_controller_pl1_target_watts 12.0" in open(_prom4b).read())
+
+# The whole point: a broken metrics path must not stop PL1 control. Put a
+# regular file where the directory has to go — makedirs then fails for any
+# uid, root included.
+_td5 = tempfile.mkdtemp()
+_blocker = os.path.join(_td5, "blocker")
+open(_blocker, "w").close()
+_cfg_broken = {
+    "setpoint": 75, "Kp": 0.25, "Ki": 0.021, "updateInterval": 1,
+    "logging": {"enabled": True, "path": os.path.join(_td5, "sensor-log.json")},
+    "metrics": {"enabled": True,
+                "path": os.path.join(_blocker, "sub", "fw_pwrctl.prom")},
+}
+hw = MockHardware()
+hw.temps = deque([80.0] * 20)
+hw.sen5_sensor_path = None
+try:
+    run_quiet(_cfg_broken, hw, max_ticks=6)
+    check("run() completes with an unwritable metrics path", True)
+except Exception as e:
+    check("run() completes with an unwritable metrics path", False, repr(e))
+check("PL1 control continues despite metrics failure",
+      len(hw.rapl_writes) >= 3, f"{len(hw.rapl_writes)} writes")
+check("JSONL logging continues despite metrics failure",
+      os.path.exists(os.path.join(_td5, "sensor-log.json")))
+
+
+# ── 7. NaN for missing values ─────────────────────────────────────────
+
+print("\n── Prometheus textfile: NaN handling ──")
+
+_sparse = writer.render({"timestamp": "2026-07-18T14:00:00+02:00"}, now=1.0)
+_sparse_samples = [ln for ln in _sparse.splitlines() if not ln.startswith("#")]
+check("sparse entry still parses", bool(parse_prom(_sparse)))
+check("missing values become NaN",
+      all(x in _sparse for x in [
+          "fw_pwrctl_rapl_pl1_watts NaN",
+          "fw_pwrctl_controller_pl1_target_watts NaN",
+          "fw_pwrctl_controller_setpoint_celsius NaN",
+          'fw_pwrctl_controller_temp_celsius{kind="median"} NaN',
+          "fw_pwrctl_idle_active NaN",
+          'fw_pwrctl_cpu_throttle_total{scope="package"} NaN',
+          'fw_pwrctl_board_temp_celsius{sensor="sen5"} NaN',
+      ]))
+check("no value is fabricated as 0",
+      not any(ln.endswith(" 0") for ln in _sparse_samples),
+      str([ln for ln in _sparse_samples if ln.endswith(" 0")]))
+check("series set is constant regardless of missing data",
+      len(_sparse_samples) == len([ln for ln in TEXT.splitlines()
+                                   if not ln.startswith("#")]))
+
+# A real 0 must survive as 0 — that is why absence is NaN and not 0.
+_zero = writer.render({"rapl_pl1_w": 0.0, "board_temps": {"sen2_c": 0.0},
+                       "throttle": {"package_throttle_count": 0}}, now=1.0)
+check("a real 0 W stays 0", "fw_pwrctl_rapl_pl1_watts 0.0" in _zero)
+check("a real 0 °C stays 0",
+      'fw_pwrctl_board_temp_celsius{sensor="sen2"} 0.0' in _zero)
+check("a real 0 count stays 0",
+      'fw_pwrctl_cpu_throttle_total{scope="package"} 0' in _zero)
+check("unaffected siblings are still NaN",
+      'fw_pwrctl_board_temp_celsius{sensor="sen3"} NaN' in _zero)
+
+# Value formatting edge cases.
+check("None -> NaN", fw_pwrctl._prom_value(None) == "NaN")
+check("float nan -> NaN", fw_pwrctl._prom_value(float("nan")) == "NaN")
+check("inf -> +Inf", fw_pwrctl._prom_value(float("inf")) == "+Inf")
+check("-inf -> -Inf", fw_pwrctl._prom_value(float("-inf")) == "-Inf")
+check("non-numeric -> NaN", fw_pwrctl._prom_value("abc") == "NaN")
+check("dict -> NaN", fw_pwrctl._prom_value({}) == "NaN")
+check("True -> 1 (not 'True')", fw_pwrctl._prom_value(True) == "1")
+check("False -> 0 (not 'False')", fw_pwrctl._prom_value(False) == "0")
+check("int stays exact", fw_pwrctl._prom_value(1791820) == "1791820")
+check("large counter is not rendered in scientific notation",
+      "e+" not in fw_pwrctl._prom_value(1791820))
+
+
+# ── 8. Integration through run() ──────────────────────────────────────
+
+print("\n── Prometheus textfile: run() integration ──")
+
+_td6 = tempfile.mkdtemp()
+_prom6 = os.path.join(_td6, "textfile", "fw_pwrctl.prom")
+_cfg6 = {
+    "setpoint": 75, "Kp": 0.25, "Ki": 0.021, "updateInterval": 2,
+    "pl1MinW": 5, "pl1MaxW": 28,
+    "logging": {"enabled": True, "path": os.path.join(_td6, "sensor-log.json")},
+    "metrics": {"enabled": True, "path": _prom6},
+}
+hw = MockHardware()
+hw.temps = deque([70.0] * 40)
+hw.sen5_sensor_path = None
+hw.system_snapshot = {
+    "rapl_pl1_w": 15.0,
+    "throttle": {"package_throttle_count": 1791820, "core_throttle_count": 247222},
+    "board_temps": {"sen2_c": 53.9, "sen3_c": 56.9, "sen4_c": 37.9, "sen5_c": 58.9},
+}
+
+_replace_calls = []
+os.replace = _spy_replace
+try:
+    run_quiet(_cfg6, hw, max_ticks=6)
+finally:
+    os.replace = _real_replace
+
+check("run() produces the .prom", os.path.exists(_prom6))
+_out6 = open(_prom6).read()
+try:
+    check("run() output parses", bool(parse_prom(_out6)))
+except ValueError as e:
+    check("run() output parses", False, str(e))
+check("run() output carries live controller values",
+      "fw_pwrctl_controller_pl1_target_watts NaN" not in _out6
+      and 'fw_pwrctl_board_temp_celsius{sensor="sen5"} 58.9' in _out6)
+check("run() file is 0644",
+      stat.S_IMODE(os.stat(_prom6).st_mode) == 0o644)
+
+# One atomic write per logged tick — the file is refreshed every tick, not
+# buffered like the JSONL log.
+_prom_replaces = [c for c in _replace_calls if c[1] == _prom6]
+_jsonl_lines = sum(1 for _ in open(os.path.join(_td6, "sensor-log.json")))
+check("one atomic write per logged tick",
+      len(_prom_replaces) == _jsonl_lines and _jsonl_lines >= 3,
+      f"{len(_prom_replaces)} writes vs {_jsonl_lines} log lines")
+check("no stray temp files left behind",
+      sorted(os.path.basename(p)
+             for p in glob.glob(os.path.join(_td6, "textfile", "*")))
+      == ["fw_pwrctl.prom"])
+
+# Metrics are an independent sink: they work with the JSONL log switched off.
+_td7 = tempfile.mkdtemp()
+_prom7 = os.path.join(_td7, "textfile", "fw_pwrctl.prom")
+_cfg7 = dict(_cfg6, metrics={"enabled": True, "path": _prom7},
+             logging={"enabled": False,
+                      "path": os.path.join(_td7, "sensor-log.json")})
+hw = MockHardware()
+hw.temps = deque([70.0] * 40)
+hw.sen5_sensor_path = None
+hw.system_snapshot = {"rapl_pl1_w": 15.0}
+run_quiet(_cfg7, hw, max_ticks=6)
+check("metrics export without JSONL logging", os.path.exists(_prom7))
+check("no JSONL written when logging is disabled",
+      not os.path.exists(os.path.join(_td7, "sensor-log.json")))
+
+# monitor mode has no controller, so those series must be NaN, not absent.
+_td8 = tempfile.mkdtemp()
+_prom8 = os.path.join(_td8, "textfile", "fw_pwrctl.prom")
+hw = MockHardware()
+hw.temps = deque([70.0] * 40)
+hw.sen5_sensor_path = None
+hw.system_snapshot = {"rapl_pl1_w": 15.0}
+run_quiet(dict(_cfg6, metrics={"enabled": True, "path": _prom8},
+               logging={"enabled": False,
+                        "path": os.path.join(_td8, "sensor-log.json")}),
+          hw, max_ticks=4, mode="monitor")
+_out8 = open(_prom8).read()
+check("monitor mode exports sensor metrics",
+      "fw_pwrctl_rapl_pl1_watts 15.0" in _out8)
+check("monitor mode leaves controller series as NaN",
+      "fw_pwrctl_controller_pl1_target_watts NaN" in _out8)
+check("monitor mode output still parses", bool(parse_prom(_out8)))
+
+# control mode collects nothing, so it exports nothing.
+_td9 = tempfile.mkdtemp()
+_prom9 = os.path.join(_td9, "textfile", "fw_pwrctl.prom")
+hw = MockHardware()
+hw.temps = deque([70.0] * 40)
+hw.sen5_sensor_path = None
+run_quiet(dict(_cfg6, metrics={"enabled": True, "path": _prom9},
+               logging={"enabled": False}),
+          hw, max_ticks=4, mode="control")
+check("control mode writes no .prom", not os.path.exists(_prom9))
 
 
 ###########################################################################

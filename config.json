@@ -6,6 +6,10 @@
     "maxLogFiles": 100,
     "flushIntervalSeconds": 120
   },
+  "metrics": {
+    "enabled": false,
+    "path": "/var/log/fw-pwrctl/textfile/fw_pwrctl.prom"
+  },
   "updateInterval": 2,
   "setpoint": 75,
   "Kp": 0.25,

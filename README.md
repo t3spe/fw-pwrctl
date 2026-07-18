@@ -135,6 +135,17 @@ EPP values: `performance`, `balance_performance`, `balance_power`, `power`
 | `logging.maxLogFiles` | 100 | 1–1000 | Max rotated log files to keep (excludes active) |
 | `logging.flushIntervalSeconds` | 120 | 10–600 s | Buffer flush interval |
 
+### Prometheus metrics
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `metrics.enabled` | false | Enable Prometheus textfile export |
+| `metrics.path` | /var/log/fw-pwrctl/textfile/fw_pwrctl.prom | `.prom` file for the node_exporter textfile collector (absolute, must end in `.prom`) |
+
+`logging` and `metrics` are independent sinks over the same sensor snapshot —
+enable either, both, or neither. See
+[Prometheus metrics](#prometheus-metrics-node_exporter-textfile-collector).
+
 ### Tuning examples
 
 **Quieter (lower performance):** Set `"setpoint": 70`, `"pl1MaxW": 20`, `"idleCeilingW": 10`
@@ -259,6 +270,85 @@ remaining sections are still logged.
 - If 3 consecutive flush attempts fail (e.g. disk full), sensor logging is
   automatically disabled for the remainder of the session to avoid repeated
   error noise
+
+### Prometheus metrics (node_exporter textfile collector)
+
+Optional. Switch it on and the daemon rewrites a `.prom` file every control
+tick (~2 s) with current values:
+
+```json
+"metrics": {
+  "enabled": true,
+  "path": "/var/log/fw-pwrctl/textfile/fw_pwrctl.prom"
+}
+```
+
+`path` is optional and defaults to the value above.
+
+This is a separate sink from `logging`, with its own `enabled` flag, so you can
+run any combination:
+
+| `logging.enabled` | `metrics.enabled` | Result |
+|---|---|---|
+| true | false | JSONL only (default — unchanged from v1.0.0) |
+| false | true | Prometheus only, no log files on disk |
+| true | true | Both, from the same snapshot |
+| false | false | Neither; the PI controller still runs |
+
+Then point node_exporter at the *directory*:
+
+    node_exporter --collector.textfile.directory=/var/log/fw-pwrctl/textfile
+
+node_exporter reads every `*.prom` in that directory on each scrape and merges
+the contents into its own `/metrics`. Nothing listens on a port and no extra
+process runs — fw-pwrctl only writes a file. Use a dedicated `textfile/`
+subdirectory so node_exporter doesn't also see `sensor-log.json`.
+
+Keep the path under `/var/log/fw-pwrctl/`: the systemd unit already grants
+`ReadWritePaths=/var/log/fw-pwrctl`, so no unit change is needed. Anywhere else
+requires adding a `ReadWritePaths=` line to the unit. The file is written
+atomically (temp file + `rename`) at mode 0644, so a scraper running as another
+uid — in a container, on a read-only bind mount — never sees a partial file.
+
+What it exports:
+
+| Metric | Type | Notes |
+|---|---|---|
+| `fw_pwrctl_rapl_pl1_watts` | gauge | Current PL1 readback |
+| `fw_pwrctl_controller_pl1_target_watts` | gauge | PL1 the controller asked for |
+| `fw_pwrctl_pl1_min_watts`, `fw_pwrctl_pl1_max_watts` | gauge | Configured bounds |
+| `fw_pwrctl_controller_setpoint_celsius` | gauge | Target temperature |
+| `fw_pwrctl_controller_temp_celsius{kind="raw\|median"}` | gauge | Controller input |
+| `fw_pwrctl_controller_error_celsius` | gauge | temp − setpoint |
+| `fw_pwrctl_controller_integral_watts` | gauge | PI integral term |
+| `fw_pwrctl_idle_ceiling_watts` | gauge | PL1 ceiling while idle |
+| `fw_pwrctl_idle_active`, `fw_pwrctl_guard_active`, `fw_pwrctl_epp_active` | gauge | 1/0 |
+| `fw_pwrctl_cpu_throttle_total{scope="package\|core"}` | counter | Thermal throttle events |
+| `fw_pwrctl_board_temp_celsius{sensor="sen2".."sen5"}` | gauge | Board sensors |
+| `fw_pwrctl_build_info{version="…"}`, `fw_pwrctl_up` | gauge | Always 1 |
+| `fw_pwrctl_last_write_timestamp_seconds` | gauge | Unix time of the last write |
+
+CPU and memory stats are deliberately **not** exported — node_exporter's own
+collectors already provide them as `node_cpu_*` / `node_memory_*`, and the
+`hwmon` collector covers the EC fan and temperature chips.
+
+The highest-value alert is throttling, because these counters only ever rise:
+
+```yaml
+- alert: FwPwrctlThrottling
+  expr: rate(fw_pwrctl_cpu_throttle_total[5m]) > 0
+- alert: FwPwrctlStale          # writer died but the file lingers
+  expr: time() - fw_pwrctl_last_write_timestamp_seconds > 60
+```
+
+Values are always current-only (no history) and at most one tick stale. A
+metric unavailable this tick is exported as `NaN`, never as a fabricated `0` —
+a real 0 W is meaningful, absence is not. Requires `--mode full` or
+`--mode monitor`; `--mode control` collects no sensor data to export.
+
+If the write fails (disk full, path unwritable), the daemon logs one line to
+the journal and keeps controlling PL1 — the `.prom` just goes stale, which
+`FwPwrctlStale` above catches.
 
 ## Uninstall
 

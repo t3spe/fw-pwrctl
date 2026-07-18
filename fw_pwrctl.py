@@ -22,7 +22,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 ECTOOL = "/usr/local/bin/ectool"
 ECTOOL_CMD = (ECTOOL, "--interface=dev")
@@ -705,12 +705,245 @@ class PIPL1Controller:
         return state
 
 
+def _prom_escape_label(value):
+    """Escape a label value per the text exposition format."""
+    return (str(value).replace("\\", "\\\\")
+                      .replace('"', '\\"')
+                      .replace("\n", "\\n"))
+
+
+def _prom_escape_help(text):
+    """Escape HELP text. Only backslash and newline are special there."""
+    return str(text).replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def _prom_labels(labels):
+    """Render a label set as {k="v",...}, or "" when there are no labels."""
+    if not labels:
+        return ""
+    return "{" + ",".join(f'{k}="{_prom_escape_label(v)}"'
+                          for k, v in labels.items()) + "}"
+
+
+def _prom_value(value):
+    """Format a sample value.
+
+    Missing or non-numeric values become NaN, never a fabricated 0 — a real
+    0 W or 0 °C is meaningful, absence is not. Booleans become 1/0.
+    """
+    if isinstance(value, bool):  # before int: bool is a subclass of int
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "NaN"
+    if num != num:
+        return "NaN"  # Python prints 'nan'; Prometheus requires 'NaN'
+    if num == float("inf"):
+        return "+Inf"
+    if num == float("-inf"):
+        return "-Inf"
+    return repr(num)
+
+
+class PrometheusTextfileWriter:
+    """Write current telemetry to a Prometheus textfile-collector .prom file.
+
+    node_exporter's textfile collector reads every *.prom in a directory on
+    each scrape and merges the contents into its own /metrics output. This
+    writer drops one such file and keeps it current: the whole file is
+    rewritten every control tick, so scraped values are at most one tick
+    (~updateInterval) stale. It holds no history — only current values.
+
+    The write is atomic (temp file in the same directory, then os.replace)
+    because node_exporter reads on its own schedule and must never observe a
+    half-written file. The temp deliberately does not end in .prom, or
+    node_exporter would try to parse it too.
+
+    Never raises: a metrics failure must not disturb the control loop. On
+    failure the file simply goes stale, which is detectable downstream via
+    fw_pwrctl_last_write_timestamp_seconds.
+    """
+
+    FILE_MODE = 0o644  # node_exporter reads this as a different uid
+    DIR_MODE = 0o755   # ...and has to be able to traverse into the directory
+    BOARD_SENSORS = ("sen2", "sen3", "sen4", "sen5")
+    # Repeated failures are reported at most this often. At one write per
+    # ~2s, an unwritable path would otherwise flood the journal with tens of
+    # thousands of identical lines per day.
+    FAILURE_REPORT_INTERVAL = 300
+
+    def __init__(self, path):
+        self.path = path
+        # The temp must share a filesystem with the destination for
+        # os.replace to be atomic — keep it in the same directory. The pid
+        # keeps two instances from clobbering each other's temp.
+        self._tmp_path = f"{path}.{os.getpid()}.tmp"
+        self._need_mkdir = True
+        self._failures = 0
+        self._last_report = 0.0
+        try:
+            self._ensure_dir()
+        except Exception as e:
+            # Non-fatal, and deliberately not just OSError: nothing about
+            # metrics setup may stop the daemon from starting. Retried on
+            # every write attempt.
+            print(f"Prometheus textfile directory not ready: {e}",
+                  file=sys.stderr, flush=True)
+
+    def write(self, entry, now=None):
+        """Render `entry` and atomically replace the .prom file.
+
+        Never raises — metrics must not crash the control loop.
+        """
+        try:
+            self._write(entry, now)
+            self._failures = 0
+        except Exception as e:
+            self._report_failure(e)
+
+    def _write(self, entry, now=None):
+        """Inner implementation of write() — may raise."""
+        text = self.render(entry, now)
+        if self._need_mkdir:
+            self._ensure_dir()
+        try:
+            with open(self._tmp_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            # open() masks the mode with the umask, so set it explicitly:
+            # node_exporter runs as another uid and must be able to read the
+            # file. os.replace carries the mode over to the destination.
+            os.chmod(self._tmp_path, self.FILE_MODE)
+            os.replace(self._tmp_path, self.path)
+        except Exception:
+            self._remove_tmp()  # never leave a stray temp behind
+            raise
+
+    def _ensure_dir(self):
+        """Create the containing directory. May raise OSError."""
+        directory = os.path.dirname(self.path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+            # makedirs' mode is masked by the umask, so a restrictive umask
+            # would leave a 0700 directory and node_exporter could not
+            # traverse in — which would make FILE_MODE pointless. Only
+            # applied to a directory we just created; one the operator
+            # already set up is theirs to permission.
+            try:
+                os.chmod(directory, self.DIR_MODE)
+            except OSError:
+                pass
+        self._need_mkdir = False
+
+    def _remove_tmp(self):
+        """Best-effort temp cleanup."""
+        try:
+            os.remove(self._tmp_path)
+        except OSError:
+            pass
+
+    def _report_failure(self, exc):
+        """Print a rate-limited failure line and arm a directory retry."""
+        self._failures += 1
+        self._need_mkdir = True  # the directory may have gone away
+        now = time.monotonic()
+        if (self._failures == 1
+                or now - self._last_report >= self.FAILURE_REPORT_INTERVAL):
+            print(f"Prometheus textfile write failed ({self._failures}x): {exc}",
+                  file=sys.stderr, flush=True)
+            self._last_report = now
+
+    def render(self, entry, now=None):
+        """Render a sensor `entry` in the Prometheus text exposition format.
+
+        Every family is emitted on every tick, with NaN where a value is
+        unavailable, so the exported series set stays constant between
+        scrapes.
+
+        entry["cpu"] and entry["memory"] are deliberately not exported —
+        node_exporter already provides those as node_cpu_*/node_memory_*.
+        """
+        controller = entry.get("controller") or {}
+        throttle = entry.get("throttle") or {}
+        board = entry.get("board_temps") or {}
+
+        # (name, type, help, [(labels, value), ...]) — one HELP/TYPE pair per
+        # family, so a name can never be declared twice.
+        families = [
+            ("fw_pwrctl_build_info", "gauge",
+             "fw-pwrctl version, always 1.",
+             [({"version": __version__}, 1)]),
+            ("fw_pwrctl_up", "gauge",
+             "1 if fw-pwrctl wrote this file.",
+             [({}, 1)]),
+            ("fw_pwrctl_last_write_timestamp_seconds", "gauge",
+             "Unix time this file was written.",
+             [({}, time.time() if now is None else now)]),
+            ("fw_pwrctl_rapl_pl1_watts", "gauge",
+             "Current RAPL PL1 power limit (readback).",
+             [({}, entry.get("rapl_pl1_w"))]),
+            ("fw_pwrctl_controller_pl1_target_watts", "gauge",
+             "PL1 the PI controller last asked for.",
+             [({}, controller.get("pl1_w"))]),
+            ("fw_pwrctl_pl1_min_watts", "gauge",
+             "Configured PL1 lower bound.",
+             [({}, controller.get("pl1_min_w"))]),
+            ("fw_pwrctl_pl1_max_watts", "gauge",
+             "Configured PL1 upper bound.",
+             [({}, controller.get("pl1_max_w"))]),
+            ("fw_pwrctl_controller_setpoint_celsius", "gauge",
+             "PI controller temperature setpoint.",
+             [({}, controller.get("setpoint_c"))]),
+            ("fw_pwrctl_controller_temp_celsius", "gauge",
+             "Controller input temperature.",
+             [({"kind": "raw"}, controller.get("raw_temp_c")),
+              ({"kind": "median"}, controller.get("median_c"))]),
+            ("fw_pwrctl_controller_error_celsius", "gauge",
+             "temp - setpoint (positive = too hot).",
+             [({}, controller.get("error"))]),
+            ("fw_pwrctl_controller_integral_watts", "gauge",
+             "PI integral term.",
+             [({}, controller.get("integral"))]),
+            ("fw_pwrctl_idle_ceiling_watts", "gauge",
+             "PL1 ceiling applied while idle mode is engaged.",
+             [({}, controller.get("idle_ceiling_w"))]),
+            ("fw_pwrctl_idle_active", "gauge",
+             "1 when idle mode is engaged.",
+             [({}, controller.get("idle_active"))]),
+            ("fw_pwrctl_guard_active", "gauge",
+             "1 when the SEN5 board-sensor guard is engaged.",
+             [({}, controller.get("guard_active"))]),
+            ("fw_pwrctl_epp_active", "gauge",
+             "1 when the idle energy-performance preference is applied.",
+             [({}, controller.get("epp_active"))]),
+            ("fw_pwrctl_cpu_throttle_total", "counter",
+             "Cumulative CPU thermal-throttle events.",
+             [({"scope": "package"}, throttle.get("package_throttle_count")),
+              ({"scope": "core"}, throttle.get("core_throttle_count"))]),
+            ("fw_pwrctl_board_temp_celsius", "gauge",
+             "Board sensor temperatures.",
+             [({"sensor": s}, board.get(f"{s}_c")) for s in self.BOARD_SENSORS]),
+        ]
+
+        lines = []
+        for name, metric_type, help_text, samples in families:
+            lines.append(f"# HELP {name} {_prom_escape_help(help_text)}")
+            lines.append(f"# TYPE {name} {metric_type}")
+            for labels, value in samples:
+                lines.append(f"{name}{_prom_labels(labels)} {_prom_value(value)}")
+        return "\n".join(lines) + "\n"
+
+
 class SensorLogger:
     """Append JSON-lines sensor snapshots to a log file."""
 
     MAX_BUFFER_ENTRIES = 1000  # ~2000s at 2s intervals, ~1MB
 
-    def __init__(self, config, hw=None):
+    def __init__(self, config, hw=None, metrics_config=None):
         self.enabled = config.get("enabled", False)
         self.path = config.get("path", "/var/log/fw-pwrctl/sensor-log.json")
         self.max_size = config.get("maxSizeMB", 50) * 1024 * 1024
@@ -724,13 +957,23 @@ class SensorLogger:
         self._meta_path = os.path.join(os.path.dirname(self.path),
                                        "sensor-log-meta.json")
         self._meta_lock = threading.Lock()
+        # Second output sink, configured exactly like the JSONL log above and
+        # switched on independently: either, both, or neither.
+        metrics_config = metrics_config or {}
+        self.metrics_enabled = metrics_config.get("enabled", False)
+        self.metrics_path = metrics_config.get(
+            "path", "/var/log/fw-pwrctl/textfile/fw_pwrctl.prom")
+        self._metrics = (PrometheusTextfileWriter(self.metrics_path)
+                         if self.metrics_enabled else None)
 
     def log(self, controller_state=None):
         """Collect all sensor data and append one JSON line.
 
         Never raises — logging must not crash the control loop.
         """
-        if not self.enabled:
+        # Either sink is reason enough to collect the snapshot — they are
+        # enabled independently.
+        if not (self.enabled or self._metrics):
             return
         try:
             self._collect_and_buffer(controller_state)
@@ -747,6 +990,20 @@ class SensorLogger:
         # Controller internal state
         if controller_state is not None:
             entry["controller"] = controller_state
+
+        # Prometheus textfile export — immediate and unbuffered, so scraped
+        # values are never more than one tick stale. Its own try/except: a
+        # metrics failure must not abort JSONL buffering below (write() is
+        # already fail-safe; this is the belt to its braces).
+        if self._metrics is not None:
+            try:
+                self._metrics.write(entry)
+            except Exception as e:
+                print(f"Prometheus textfile write failed: {e}",
+                      file=sys.stderr, flush=True)
+
+        if not self.enabled:
+            return  # metrics-only: nothing to buffer or flush
 
         # Buffer in memory (cap size to prevent runaway growth)
         self._buffer.append(json.dumps(entry))
@@ -1028,7 +1285,7 @@ _KNOWN_KEYS = {
     "updateInterval", "idleCeilingW", "idleTempC", "idleReleaseTempC",
     "idleEPP", "normalEPP",
     "sen5GuardTemp", "sen5CriticalTemp", "sen5ReleaseTemp", "sen5CutRateW",
-    "logging",
+    "logging", "metrics",
 }
 
 
@@ -1059,6 +1316,23 @@ def validate_config(config):
             ml = log["maxLogFiles"]
             if not isinstance(ml, int) or ml <= 0:
                 raise ValueError("logging.maxLogFiles must be a positive integer")
+    # Prometheus textfile export — same shape as logging, enabled separately
+    if "metrics" in config:
+        met = config["metrics"]
+        if not isinstance(met, dict):
+            raise ValueError("metrics must be an object")
+        if not isinstance(met.get("enabled", False), bool):
+            raise ValueError("metrics.enabled must be a boolean")
+        if "path" in met:
+            if not isinstance(met["path"], str):
+                raise ValueError("metrics.path must be a string")
+            if not met["path"].endswith(".prom"):
+                # node_exporter's textfile collector only reads *.prom, so
+                # any other suffix would silently export nothing.
+                raise ValueError("metrics.path must end in .prom")
+            if not os.path.isabs(met["path"]):
+                # The daemon's cwd is / under systemd — relative paths trap.
+                raise ValueError("metrics.path must be an absolute path")
 
 
 def preflight_checks(hw):
@@ -1091,8 +1365,12 @@ def run(config, hw, debug=False, max_ticks=0, mode="full"):
     do_monitor = mode in ("full", "monitor")
 
     # Sensor logging (skip hw wiring when not monitoring — avoids discover_board_sensors())
+    # Both sinks read the same snapshot, so both belong to the monitor path:
+    # control-only mode collects nothing to write.
     log_config = config.get("logging", {})
-    sensor_logger = SensorLogger(log_config, hw if do_monitor else None)
+    metrics_config = config.get("metrics", {}) if do_monitor else {}
+    sensor_logger = SensorLogger(log_config, hw if do_monitor else None,
+                                 metrics_config=metrics_config)
     if not do_monitor:
         sensor_logger.enabled = False
 
@@ -1220,6 +1498,9 @@ def run(config, hw, debug=False, max_ticks=0, mode="full"):
         print(f"Sensor logging: {sensor_logger.path} "
               f"(every {update_freq}s, flush every {sensor_logger.flush_interval}s, "
               f"max {log_config.get('maxSizeMB', 50)}MB)", flush=True)
+    if sensor_logger.metrics_enabled:
+        print(f"Prometheus metrics: {sensor_logger.metrics_path} "
+              f"(rewritten every {update_freq}s)", flush=True)
     if hw.dry_run:
         print("DRY RUN — not calling ectool/RAPL", flush=True)
 
