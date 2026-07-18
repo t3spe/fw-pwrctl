@@ -296,7 +296,7 @@ Common messages in `journalctl -u fw-pwrctl`:
 
 **Startup messages** (normal, in order):
 
-    fw-pwrctl 1.0.0
+    fw-pwrctl 1.1.0
     Mode: full
     Sensor: /sys/class/hwmon/hwmon4/temp1_input (65.2°C)
     Controller: setpoint=75°C, Kp=0.25, Ki=0.021, PL1=5-28W, update every 2s, SEN5=...
@@ -374,6 +374,45 @@ Or from a checkout (before installing): `sudo python3 fw_pwrctl.py --mode monito
 Or via the systemd service (edit the unit to add `--mode monitor`, then
 restart). Compare the sensor-plot output between monitor and full mode
 to see the daemon's effect on fan speed and temperatures.
+
+### Can I get this into Prometheus / Grafana?
+
+Yes, without running an HTTP server. Enable the `metrics` sink in
+`config.json`:
+
+    "metrics": {
+      "enabled": true,
+      "path": "/var/log/fw-pwrctl/textfile/fw_pwrctl.prom"
+    }
+
+The daemon rewrites that file every control tick. Point an existing
+node_exporter at the directory with
+`--collector.textfile.directory=/var/log/fw-pwrctl/textfile` and it merges
+fw-pwrctl's metrics into its own `/metrics` on each scrape.
+
+Keep the path under `/var/log/fw-pwrctl/` — the systemd unit already allows
+writes there. Elsewhere you must add a `ReadWritePaths=` line to the unit, or
+the daemon logs `Prometheus textfile write failed: Read-only file system`.
+
+It is off by default, adds no dependencies, and a write failure never affects
+PL1 control — the file just stops updating. Alert on that with
+`time() - fw_pwrctl_last_write_timestamp_seconds > 60`. See the README for the
+full metric list.
+
+### Can I use Prometheus without the JSONL sensor log?
+
+Yes. `logging` and `metrics` are independent sinks with their own `enabled`
+flags, both fed from the same sensor snapshot. For Prometheus only, with
+nothing accumulating on disk:
+
+    "logging": { "enabled": false },
+    "metrics": { "enabled": true }
+
+Enabling both is fine too — the snapshot is collected once per tick and handed
+to each sink. Note that `sensor-plot.sh` needs the JSONL log, so turning
+`logging` off means no plots.
+
+Nothing is exported in `--mode control`, which collects no sensor data.
 
 ---
 
